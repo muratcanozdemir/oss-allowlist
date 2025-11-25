@@ -1,0 +1,7 @@
+packages:
+  - group: org.apache.commons
+    artifact: commons-lang3
+    version: 3.13.0
+  - group: com.google.guava
+    artifact: guava
+    version: 32.1.2

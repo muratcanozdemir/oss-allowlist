@@ -1,0 +1,70 @@
+name: Intake
+
+on:
+  pull_request:
+    paths:
+      - "data/*.yaml"
+      - "scripts/**"
+
+jobs:
+  intake:
+    runs-on: self-hosted
+    env:
+      S3_BUCKET: "my-s3-cache-bucket"
+      MAVEN_REMOTE_URL: "https://repo.maven.apache.org/maven2"
+      JFROG_REPO_URL: "https://mycompany.jfrog.io/artifactory"
+      MAVEN_LOCAL_REPO: "${{ github.workspace }}/.m2/repository"
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+      JFROG_API_KEY: ${{ secrets.JFROG_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup dependencies via uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv python install '3.12'
+
+      - name: Install Grype CLI
+        run: |
+          GRYPE_VERSION="v0.77.0"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/main/install.sh" | bash -s -- -b /usr/local/bin $GRYPE_VERSION
+          grype version
+
+      - name: Install Syft CLI
+        run: |
+          SYFT_VERSION="v0.88.0"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/main/install.sh" | bash -s -- -b /usr/local/bin $SYFT_VERSION
+          syft version
+
+      - name: Extract added entries
+        id: extract
+        run: uv run extract_added > added.json
+
+      - name: Fail fast if none
+        if: steps.extract.outcome == 'success' && !steps.extract.conclusion
+        run: echo "No new packages to process."
+
+      - name: Fetch artifacts
+        run: uv run fetch added.json
+
+      - name: Verify SHA256
+        run: uv run verify
+
+      - name: Generate SBOM
+        run: uv run sbom
+
+      - name: Scan vulnerabilities
+        run: uv run vuln
+
+      - name: Enforce policy
+        run: uv run policy
+
+      - name: Publish artifacts
+        run: uv run publish
+
+      - name: Comment PR on failure
+        if: failure()
+        run: gh pr comment "$PR_NUMBER" --body "❌ Intake failed. See logs."
