@@ -1,70 +1,99 @@
 name: Intake
 
+# Pull requests run every check; only a merge to main publishes.
 on:
   pull_request:
-    paths:
-      - "data/*.yaml"
-      - "scripts/**"
+    paths: ["data/*.yaml"]
+  push:
+    branches: [main]
+    paths: ["data/*.yaml"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: intake-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SYFT_VERSION: v1.57.2
+  GRYPE_VERSION: v0.122.1
 
 jobs:
   intake:
     runs-on: self-hosted
     env:
-      S3_BUCKET: "my-s3-cache-bucket"
       MAVEN_REMOTE_URL: "https://repo.maven.apache.org/maven2"
-      JFROG_REPO_URL: "https://mycompany.jfrog.io/artifactory"
-      MAVEN_LOCAL_REPO: "${{ github.workspace }}/.m2/repository"
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-      JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
-      JFROG_API_KEY: ${{ secrets.JFROG_API_KEY }}
+      POLICY_FAIL_ON: critical
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup dependencies via uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv python install '3.12'
+      - uses: astral-sh/setup-uv@v6
 
-      - name: Install Grype CLI
-        run: |
-          GRYPE_VERSION="v0.77.0"
-          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/main/install.sh" | bash -s -- -b /usr/local/bin $GRYPE_VERSION
-          grype version
+      - run: uv sync --locked --no-dev
 
-      - name: Install Syft CLI
+      - name: Install Syft and Grype
         run: |
-          SYFT_VERSION="v0.88.0"
-          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/main/install.sh" | bash -s -- -b /usr/local/bin $SYFT_VERSION
-          syft version
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/$SYFT_VERSION/install.sh" | sh -s -- -b "$RUNNER_TEMP/bin" "$SYFT_VERSION"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/$GRYPE_VERSION/install.sh" | sh -s -- -b "$RUNNER_TEMP/bin" "$GRYPE_VERSION"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Extract added entries
         id: extract
-        run: uv run extract_added > added.json
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: uv run oss-allowlist extract --base "$BASE"
 
-      - name: Fail fast if none
-        if: steps.extract.outcome == 'success' && !steps.extract.conclusion
-        run: echo "No new packages to process."
+      - name: Fetch
+        if: steps.extract.outputs.count != '0'
+        run: uv run oss-allowlist fetch added.json
 
-      - name: Fetch artifacts
-        run: uv run fetch added.json
+      - name: Verify digests
+        if: steps.extract.outputs.count != '0'
+        run: uv run oss-allowlist verify
 
-      - name: Verify SHA256
-        run: uv run verify
-
-      - name: Generate SBOM
-        run: uv run sbom
+      - name: Generate SBOMs
+        if: steps.extract.outputs.count != '0'
+        run: uv run oss-allowlist sbom
 
       - name: Scan vulnerabilities
-        run: uv run vuln
+        if: steps.extract.outputs.count != '0'
+        run: uv run oss-allowlist vuln
 
       - name: Enforce policy
-        run: uv run policy
+        if: steps.extract.outputs.count != '0'
+        run: uv run oss-allowlist policy
 
-      - name: Publish artifacts
-        run: uv run publish
+      - name: Upload reports
+        if: always() && steps.extract.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: intake-reports
+          path: |
+            added.json
+            dist/manifest.json
+            dist/reports/
 
-      - name: Comment PR on failure
-        if: failure()
-        run: gh pr comment "$PR_NUMBER" --body "❌ Intake failed. See logs."
+      - name: Publish
+        if: github.event_name == 'push' && steps.extract.outputs.count != '0'
+        env:
+          JFROG_PYPI_URL: ${{ vars.JFROG_PYPI_URL }}
+          JFROG_MAVEN_URL: ${{ vars.JFROG_MAVEN_URL }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_API_KEY: ${{ secrets.JFROG_API_KEY }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: uv run oss-allowlist publish
+
+      - name: Comment on PR failure
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body "❌ Intake failed. See [the run]($RUN_URL)."
