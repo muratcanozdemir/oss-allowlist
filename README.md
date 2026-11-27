@@ -41,6 +41,12 @@ Only entries that are new relative to the PR's merge base are processed. A versi
 
 Every step exits non-zero on failure; add `-v` for a traceback.
 
+### Call graph
+
+How the modules in `src/oss_allowlist/` call each other, from the CLI commands down to the step implementations:
+
+![Call graph of src/oss_allowlist](docs/codegraph-oss-allowlist.svg)
+
 ## Configuration
 
 | Variable | Used by | Notes |
